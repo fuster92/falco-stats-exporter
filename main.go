@@ -10,13 +10,18 @@ import (
 	"golang.org/x/exp/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 )
 
-func tailMetricFile(metricsFilePath string) (<-chan string, error) {
+func tailMetricFile(metricsFilePath string, errors chan error) (
+	<-chan string,
+	error,
+) {
 	t, err := tail.TailFile(
 		metricsFilePath, tail.Config{
 			Follow: true,
+			Logger: tail.DiscardingLogger,
 		},
 	)
 	if err != nil {
@@ -31,6 +36,7 @@ func tailMetricFile(metricsFilePath string) (<-chan string, error) {
 		err := t.Wait()
 		if err != nil {
 			slog.Error("error waiting for tail", err)
+			errors <- err
 		}
 	}()
 	return out, nil
@@ -75,7 +81,8 @@ func setDefaultLogger() {
 func main() {
 	setDefaultLogger()
 	syscallEvents := NewFalcoMetricsFilelExporter()
-	metricFileLine, err := tailMetricFile(metricsFile)
+	errors := make(chan error)
+	metricFileLine, err := tailMetricFile(metricsFile, errors)
 	if err != nil {
 		slog.Error("error tailing metrics file", err)
 		os.Exit(1)
@@ -95,5 +102,16 @@ func main() {
 	prometheus.MustRegister(syscallEvents)
 	http.Handle("/metrics", promhttp.Handler())
 	slog.Info("starting falco-syscall-exporter", "port", exporterPort)
-	http.ListenAndServe(fmt.Sprintf(":%s", exporterPort), nil)
+	go func() {
+		errors <- http.ListenAndServe(fmt.Sprintf(":%s", exporterPort), nil)
+	}()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	select {
+	case err := <-errors:
+		slog.Error("fatal error", err)
+		os.Exit(1)
+	case <-sig:
+		slog.Info("Interrupt received, exiting")
+	}
 }
